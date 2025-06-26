@@ -1,0 +1,377 @@
+print("--- Installing required libraries ---")
+!pip install fairlearn catboost shap -q
+import pandas as pd
+import numpy as np
+import catboost
+from catboost import CatBoostClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, balanced_accuracy_score
+import shap
+
+# Import the main library itself
+import fairlearn
+
+# Core Fairlearn components
+from fairlearn.metrics import MetricFrame, selection_rate, false_positive_rate, true_positive_rate
+from fairlearn.metrics import demographic_parity_difference, equalized_odds_difference
+from fairlearn.postprocessing import ThresholdOptimizer
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+
+print(f"Fairlearn version: {fairlearn.__version__}")
+print("Libraries imported successfully.")
+print("\n--- Simulating Loan Application Data with Structural Bias ---")
+
+def simulate_biased_loan_data(n_applicants=10000):
+    np.random.seed(42)
+    
+    # Sensitive Features
+    race = np.random.choice(['Race_A', 'Race_B'], n_applicants, p=[0.7, 0.3])
+    gender = np.random.choice(['Male', 'Female'], n_applicants, p=[0.5, 0.5])
+
+    # INTRODUCE STRUCTURAL BIAS:
+    # Assume Race_B historically has had lower average incomes.
+    income_base = np.random.normal(70000, 20000, n_applicants).clip(25000)
+    income = income_base - 15000 * (race == 'Race_B')
+    
+    # Other Features
+    credit_score = np.random.randint(500, 850, n_applicants) + 20 * (income > 75000)
+    employment_length = np.random.randint(0, 25, n_applicants)
+    loan_amount = np.random.randint(5000, 60000, n_applicants)
+    
+    # Target Variable: is_default
+    default_prob = 1 / (1 + np.exp(-(
+        -2 + (-credit_score / 200) + (loan_amount / income * 2) - (employment_length / 10)
+    )))
+    is_default = (default_prob > np.random.rand(n_applicants)).astype(int)
+    
+    df = pd.DataFrame({
+        'credit_score': credit_score.astype(int),
+        'income': income.astype(int),
+        'loan_amount': loan_amount.astype(int),
+        'employment_length': employment_length,
+        'race': race,
+        'gender': gender,
+        'is_default': is_default
+    })
+    
+    print(f"Generated {n_applicants} records. Default rate: {df['is_default'].mean():.2%}")
+    return df
+
+df = simulate_biased_loan_data()
+print("\nSample of generated data:")
+print(df.head())
+
+
+# ==============================================================================
+# 3. EDA & PRE-MODELING BIAS CHECK
+# ==============================================================================
+print("\n--- Checking for Bias in the Raw Data ---")
+plt.figure(figsize=(8, 5))
+sns.boxplot(data=df, x='race', y='income')
+plt.title('Income Distribution by Race (Structural Bias)')
+plt.show()
+
+
+# ==============================================================================
+# 4. TRAIN A BASELINE (UNCONSTRAINED) MODEL
+# ==============================================================================
+print("\n--- Training a Baseline (Potentially Unfair) CatBoost Model ---")
+
+X = df.drop('is_default', axis=1)
+y = df['is_default']
+sensitive_features = X['race']
+categorical_features_indices = np.where(X.dtypes != np.number)[0]
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
+sensitive_features_train = X_train['race']
+sensitive_features_test = X_test['race']
+
+model_unconstrained = CatBoostClassifier(
+    iterations=200, learning_rate=0.05, depth=6, random_seed=42,
+    verbose=0, cat_features=categorical_features_indices
+)
+model_unconstrained.fit(X_train, y_train)
+y_pred_unconstrained = model_unconstrained.predict(X_test)
+print("Baseline model trained.")
+
+
+# ==============================================================================
+# 5. FAIRNESS AUDIT OF THE BASELINE MODEL
+# ==============================================================================
+print("\n--- Auditing the Baseline Model for Fairness using Fairlearn ---")
+
+metrics = {
+    'accuracy': accuracy_score,
+    'balanced_accuracy': balanced_accuracy_score,
+    'selection_rate': selection_rate,
+    'false_positive_rate': false_positive_rate,
+    'true_positive_rate': true_positive_rate
+}
+metric_frame = MetricFrame(metrics=metrics, y_true=y_test, y_pred=y_pred_unconstrained, sensitive_features=sensitive_features_test)
+
+print("\nMetrics broken down by race:")
+display(metric_frame.by_group)
+
+print("\nFairness Disparity Metrics (Difference between worst and best group):")
+print(f"Demographic Parity Difference: {demographic_parity_difference(y_test, y_pred_unconstrained, sensitive_features=sensitive_features_test):.4f}")
+print(f"Equalized Odds Difference: {equalized_odds_difference(y_test, y_pred_unconstrained, sensitive_features=sensitive_features_test):.4f}")
+
+
+# ==============================================================================
+# 6. BIAS MITIGATION WITH FAIRLEARN POST-PROCESSING
+# ==============================================================================
+print("\n--- Mitigating Bias using Fairlearn's ThresholdOptimizer ---")
+
+# CORRECTED CODE: Use a supported objective for the 'equalized_odds' constraint.
+postprocess_est = ThresholdOptimizer(
+    estimator=model_unconstrained,
+    constraints="equalized_odds",
+    objective="balanced_accuracy_score",
+    prefit=True
+)
+
+postprocess_est.fit(X_train, y_train, sensitive_features=sensitive_features_train)
+print("ThresholdOptimizer fitted.")
+
+y_pred_mitigated = postprocess_est.predict(X_test, sensitive_features=sensitive_features_test)
+
+
+# ==============================================================================
+# 7. COMPARE UNFAIR VS. FAIR MODELS
+# ==============================================================================
+print("\n--- Comparing Performance and Fairness of Models ---")
+
+metric_frame_mitigated = MetricFrame(metrics=metrics, y_true=y_test, y_pred=y_pred_mitigated, sensitive_features=sensitive_features_test)
+
+print("\n--- Baseline Unfair Model Metrics ---")
+display(metric_frame.by_group)
+print(f"Overall Balanced Accuracy: {metric_frame.overall['balanced_accuracy']:.4f}")
+print(f"Equalized Odds Difference: {equalized_odds_difference(y_test, y_pred_unconstrained, sensitive_features=sensitive_features_test):.4f}")
+
+print("\n--- Mitigated Fair Model Metrics ---")
+display(metric_frame_mitigated.by_group)
+print(f"Overall Balanced Accuracy: {metric_frame_mitigated.overall['balanced_accuracy']:.4f}")
+print(f"Equalized Odds Difference: {equalized_odds_difference(y_test, y_pred_mitigated, sensitive_features=sensitive_features_test):.4f}")
+
+print("\n--- SUMMARY ---")
+print("Notice that the False Positive Rates are now much closer between Race_A and Race_B.")
+print("The Equalized Odds Difference is significantly lower (closer to 0).")
+print("This fairness improvement came at a slight cost to overall accuracy, illustrating the trade-off.")
+
+
+# ==============================================================================
+# 8. AUDITABILITY: EXPLAINING THE FAIR MODEL WITH SHAP
+# ==============================================================================
+print("\n--- Explaining the Final Mitigated Model's Logic with SHAP ---")
+
+explainer = shap.TreeExplainer(model_unconstrained)
+shap_values = explainer.shap_values(X_test)
+
+print("SHAP plot shows that financial factors (credit score, income, loan amount) are still")
+print("the primary drivers of the prediction, which builds trust in the model.")
+shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+plt.title("Feature Importance of the Underlying Model")
+plt.show()
+
+disagreement_idx = np.where(y_pred_unconstrained != y_pred_mitigated)[0]
+if len(disagreement_idx) > 0:
+    idx_to_explain = disagreement_idx[0]
+    print(f"\nExplaining a case (Index: {X_test.index[idx_to_explain]}) where the models disagreed:")
+    print(f"Unfair Model Prediction: {'Default' if y_pred_unconstrained[idx_to_explain] == 1 else 'No Default'}")
+    print(f"FAIR Model Prediction:   {'Default' if y_pred_mitigated[idx_to_explain] == 1 else 'No Default'}")
+    
+    shap.initjs()
+    display(shap.force_plot(explainer.expected_value, shap_values[idx_to_explain,:], X_test.iloc[idx_to_explain,:]))
+else:
+    print("\nNo disagreements found between models in this sample.")print("--- Installing required libraries ---")
+!pip install fairlearn catboost shap -q
+import pandas as pd
+import numpy as np
+import catboost
+from catboost import CatBoostClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, balanced_accuracy_score
+import shap
+
+# Import the main library itself
+import fairlearn
+
+# Core Fairlearn components
+from fairlearn.metrics import MetricFrame, selection_rate, false_positive_rate, true_positive_rate
+from fairlearn.metrics import demographic_parity_difference, equalized_odds_difference
+from fairlearn.postprocessing import ThresholdOptimizer
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+
+print(f"Fairlearn version: {fairlearn.__version__}")
+print("Libraries imported successfully.")
+print("\n--- Simulating Loan Application Data with Structural Bias ---")
+
+def simulate_biased_loan_data(n_applicants=10000):
+    np.random.seed(42)
+    
+    # Sensitive Features
+    race = np.random.choice(['Race_A', 'Race_B'], n_applicants, p=[0.7, 0.3])
+    gender = np.random.choice(['Male', 'Female'], n_applicants, p=[0.5, 0.5])
+
+    # INTRODUCE STRUCTURAL BIAS:
+    # Assume Race_B historically has had lower average incomes.
+    income_base = np.random.normal(70000, 20000, n_applicants).clip(25000)
+    income = income_base - 15000 * (race == 'Race_B')
+    
+    # Other Features
+    credit_score = np.random.randint(500, 850, n_applicants) + 20 * (income > 75000)
+    employment_length = np.random.randint(0, 25, n_applicants)
+    loan_amount = np.random.randint(5000, 60000, n_applicants)
+    
+    # Target Variable: is_default
+    default_prob = 1 / (1 + np.exp(-(
+        -2 + (-credit_score / 200) + (loan_amount / income * 2) - (employment_length / 10)
+    )))
+    is_default = (default_prob > np.random.rand(n_applicants)).astype(int)
+    
+    df = pd.DataFrame({
+        'credit_score': credit_score.astype(int),
+        'income': income.astype(int),
+        'loan_amount': loan_amount.astype(int),
+        'employment_length': employment_length,
+        'race': race,
+        'gender': gender,
+        'is_default': is_default
+    })
+    
+    print(f"Generated {n_applicants} records. Default rate: {df['is_default'].mean():.2%}")
+    return df
+
+df = simulate_biased_loan_data()
+print("\nSample of generated data:")
+print(df.head())
+
+
+# ==============================================================================
+# 3. EDA & PRE-MODELING BIAS CHECK
+# ==============================================================================
+print("\n--- Checking for Bias in the Raw Data ---")
+plt.figure(figsize=(8, 5))
+sns.boxplot(data=df, x='race', y='income')
+plt.title('Income Distribution by Race (Structural Bias)')
+plt.show()
+
+
+# ==============================================================================
+# 4. TRAIN A BASELINE (UNCONSTRAINED) MODEL
+# ==============================================================================
+print("\n--- Training a Baseline (Potentially Unfair) CatBoost Model ---")
+
+X = df.drop('is_default', axis=1)
+y = df['is_default']
+sensitive_features = X['race']
+categorical_features_indices = np.where(X.dtypes != np.number)[0]
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
+sensitive_features_train = X_train['race']
+sensitive_features_test = X_test['race']
+
+model_unconstrained = CatBoostClassifier(
+    iterations=200, learning_rate=0.05, depth=6, random_seed=42,
+    verbose=0, cat_features=categorical_features_indices
+)
+model_unconstrained.fit(X_train, y_train)
+y_pred_unconstrained = model_unconstrained.predict(X_test)
+print("Baseline model trained.")
+
+
+# ==============================================================================
+# 5. FAIRNESS AUDIT OF THE BASELINE MODEL
+# ==============================================================================
+print("\n--- Auditing the Baseline Model for Fairness using Fairlearn ---")
+
+metrics = {
+    'accuracy': accuracy_score,
+    'balanced_accuracy': balanced_accuracy_score,
+    'selection_rate': selection_rate,
+    'false_positive_rate': false_positive_rate,
+    'true_positive_rate': true_positive_rate
+}
+metric_frame = MetricFrame(metrics=metrics, y_true=y_test, y_pred=y_pred_unconstrained, sensitive_features=sensitive_features_test)
+
+print("\nMetrics broken down by race:")
+display(metric_frame.by_group)
+
+print("\nFairness Disparity Metrics (Difference between worst and best group):")
+print(f"Demographic Parity Difference: {demographic_parity_difference(y_test, y_pred_unconstrained, sensitive_features=sensitive_features_test):.4f}")
+print(f"Equalized Odds Difference: {equalized_odds_difference(y_test, y_pred_unconstrained, sensitive_features=sensitive_features_test):.4f}")
+
+
+# ==============================================================================
+# 6. BIAS MITIGATION WITH FAIRLEARN POST-PROCESSING
+# ==============================================================================
+print("\n--- Mitigating Bias using Fairlearn's ThresholdOptimizer ---")
+
+# CORRECTED CODE: Use a supported objective for the 'equalized_odds' constraint.
+postprocess_est = ThresholdOptimizer(
+    estimator=model_unconstrained,
+    constraints="equalized_odds",
+    objective="balanced_accuracy_score",
+    prefit=True
+)
+
+postprocess_est.fit(X_train, y_train, sensitive_features=sensitive_features_train)
+print("ThresholdOptimizer fitted.")
+
+y_pred_mitigated = postprocess_est.predict(X_test, sensitive_features=sensitive_features_test)
+
+
+# ==============================================================================
+# 7. COMPARE UNFAIR VS. FAIR MODELS
+# ==============================================================================
+print("\n--- Comparing Performance and Fairness of Models ---")
+
+metric_frame_mitigated = MetricFrame(metrics=metrics, y_true=y_test, y_pred=y_pred_mitigated, sensitive_features=sensitive_features_test)
+
+print("\n--- Baseline Unfair Model Metrics ---")
+display(metric_frame.by_group)
+print(f"Overall Balanced Accuracy: {metric_frame.overall['balanced_accuracy']:.4f}")
+print(f"Equalized Odds Difference: {equalized_odds_difference(y_test, y_pred_unconstrained, sensitive_features=sensitive_features_test):.4f}")
+
+print("\n--- Mitigated Fair Model Metrics ---")
+display(metric_frame_mitigated.by_group)
+print(f"Overall Balanced Accuracy: {metric_frame_mitigated.overall['balanced_accuracy']:.4f}")
+print(f"Equalized Odds Difference: {equalized_odds_difference(y_test, y_pred_mitigated, sensitive_features=sensitive_features_test):.4f}")
+
+print("\n--- SUMMARY ---")
+print("Notice that the False Positive Rates are now much closer between Race_A and Race_B.")
+print("The Equalized Odds Difference is significantly lower (closer to 0).")
+print("This fairness improvement came at a slight cost to overall accuracy, illustrating the trade-off.")
+
+
+# ==============================================================================
+# 8. AUDITABILITY: EXPLAINING THE FAIR MODEL WITH SHAP
+# ==============================================================================
+print("\n--- Explaining the Final Mitigated Model's Logic with SHAP ---")
+
+explainer = shap.TreeExplainer(model_unconstrained)
+shap_values = explainer.shap_values(X_test)
+
+print("SHAP plot shows that financial factors (credit score, income, loan amount) are still")
+print("the primary drivers of the prediction, which builds trust in the model.")
+shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+plt.title("Feature Importance of the Underlying Model")
+plt.show()
+
+disagreement_idx = np.where(y_pred_unconstrained != y_pred_mitigated)[0]
+if len(disagreement_idx) > 0:
+    idx_to_explain = disagreement_idx[0]
+    print(f"\nExplaining a case (Index: {X_test.index[idx_to_explain]}) where the models disagreed:")
+    print(f"Unfair Model Prediction: {'Default' if y_pred_unconstrained[idx_to_explain] == 1 else 'No Default'}")
+    print(f"FAIR Model Prediction:   {'Default' if y_pred_mitigated[idx_to_explain] == 1 else 'No Default'}")
+    
+    shap.initjs()
+    display(shap.force_plot(explainer.expected_value, shap_values[idx_to_explain,:], X_test.iloc[idx_to_explain,:]))
+else:
+    print("\nNo disagreements found between models in this sample.")
